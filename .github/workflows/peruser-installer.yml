@@ -1,0 +1,135 @@
+name: per-user installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: per-user-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and MSVC path
+        id: env
+        shell: pwsh
+        run: |
+          $h = Get-Content C/7zVersion.h -Raw
+          $m = [regex]::Match($h, 'MY_VERSION_NUMBERS\s+"([^"]+)"')
+          if (-not $m.Success) { throw 'MY_VERSION_NUMBERS not found in C/7zVersion.h' }
+          $ver = $m.Groups[1].Value
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC x64 tools not found' }
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+          "digits=$($ver.Replace('.',''))" >> $env:GITHUB_OUTPUT
+          "vcvars=$vs\VC\Auxiliary\Build\vcvars64.bat" >> $env:GITHUB_OUTPUT
+
+      - name: Patch installer to per-user
+        shell: pwsh
+        run: ./patch/per-user-installer.ps1
+
+      - name: Build x64 binaries
+        shell: cmd
+        run: |
+          call "${{ steps.env.outputs.vcvars }}" >nul
+          set PLATFORM=x64
+          pushd CPP\7zip\Bundles\Format7zF
+          nmake -nologo || exit /b 1
+          popd
+          pushd CPP\7zip\UI\Console
+          nmake -nologo || exit /b 1
+          popd
+          pushd CPP\7zip\UI\FileManager
+          nmake -nologo || exit /b 1
+          popd
+          pushd CPP\7zip\UI\GUI
+          nmake -nologo || exit /b 1
+          popd
+          pushd CPP\7zip\UI\Explorer
+          nmake -nologo || exit /b 1
+          popd
+          pushd CPP\7zip\Bundles\SFXWin
+          nmake -nologo || exit /b 1
+          popd
+          pushd CPP\7zip\Bundles\SFXCon
+          nmake -nologo || exit /b 1
+          popd
+          pushd C\Util\7zipInstall
+          nmake -nologo || exit /b 1
+          popd
+
+      - name: Assemble installer
+        id: asm
+        shell: pwsh
+        run: |
+          $ver = '${{ steps.env.outputs.ver }}'
+          $digits = '${{ steps.env.outputs.digits }}'
+          $out = "7z$digits-x64-peruser.exe"
+
+          New-Item -ItemType Directory -Force tool, stage, aux | Out-Null
+          Copy-Item CPP/7zip/UI/Console/x64/7z.exe tool/
+          Copy-Item CPP/7zip/Bundles/Format7zF/x64/7z.dll tool/
+
+          $url = "https://github.com/ip7z/7zip/releases/download/$ver/7z$digits-x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile official.exe
+          & ./tool/7z.exe x official.exe -oaux -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'failed to extract the official installer' }
+
+          $bin = @(
+            'CPP/7zip/UI/FileManager/x64/7zFM.exe',
+            'CPP/7zip/UI/Console/x64/7z.exe',
+            'CPP/7zip/UI/GUI/x64/7zG.exe',
+            'CPP/7zip/Bundles/Format7zF/x64/7z.dll',
+            'CPP/7zip/UI/Explorer/x64/7-zip.dll',
+            'CPP/7zip/Bundles/SFXWin/x64/7z.sfx',
+            'CPP/7zip/Bundles/SFXCon/x64/7zCon.sfx'
+          )
+          foreach ($f in $bin) {
+            if (-not (Test-Path $f)) { throw "missing build output: $f" }
+            Copy-Item $f stage/
+          }
+          Copy-Item DOC/License.txt, DOC/readme.txt, DOC/copying.txt stage/
+          foreach ($f in @('7-zip.chm', 'Uninstall.exe', 'descript.ion', 'History.txt')) {
+            if (Test-Path "aux/$f") { Copy-Item "aux/$f" stage/ }
+          }
+          if (Test-Path aux/Lang) { Copy-Item aux/Lang stage/ -Recurse }
+
+          Push-Location stage
+          & ../tool/7z.exe a -t7z -mx=9 ../payload.7z *
+          Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw 'failed to create the payload archive' }
+
+          cmd /c "copy /b C\Util\7zipInstall\x64\7zipInstall.exe + payload.7z $out" | Out-Null
+          if (-not (Test-Path $out)) { throw 'installer was not created' }
+
+          $list = & ./tool/7z.exe l $out
+          if (($list -join "`n") -notmatch '7zFM\.exe') { throw 'installer payload is not readable' }
+
+          "installer=$out" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = '${{ steps.env.outputs.ver }}'
+          $file = '${{ steps.asm.outputs.installer }}'
+          $notes = 'Per-user x64 build. Installs to %LOCALAPPDATA%\7-Zip, writes only HKEY_CURRENT_USER, runs as invoker. No administrator rights required.'
+          gh release view $ver *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $ver $file --clobber
+            gh release edit $ver --title "7-Zip $ver (x64, per-user)" --notes $notes
+          } else {
+            gh release create $ver $file --title "7-Zip $ver (x64, per-user)" --notes $notes
+          }
